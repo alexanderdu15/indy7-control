@@ -1,0 +1,17 @@
+robot:
+  name: "indy7"
+  ip: "160.39.102.52"
+  index: 0
+  dof: 6
+  use_sim: false
+
+trajopt: # MPCGPU solver settings
+  knot_points: 10
+  state_size: 12 # 6 joints * 2 (position + velocity)
+  control_size: 6 # 6 joints
+  timestep: 0.015625 # 1/64
+  float_type: "float" # "float" or "double"
+  pcg_max_iter: 173
+  pcg_exit_tol: 5e-6
+
+  
