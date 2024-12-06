@@ -16,6 +16,7 @@ namespace msgs = indy7_msgs::msg;
 using Clock = std::chrono::system_clock;
 using TimePoint = std::chrono::time_point<Clock>;
 using Duration = std::chrono::duration<double>;
+using SimTime = rclcpp::Time;
 
 class TrajoptNode : public rclcpp::Node
 {
@@ -27,60 +28,62 @@ public:
       pcg_max_iter_(173),
       state_updated_(false),
       warm_start_complete_(false),
-      trajectory_start_time_()
+      trajectory_start_time_(),
+      use_sim_time_(false)
     {
+        use_sim_time_ = get_parameter("use_sim_time").as_bool();
+        RCLCPP_INFO(this->get_logger(), "Using %s time", use_sim_time_ ? "simulation" : "system");
+
         RCLCPP_INFO(this->get_logger(), "Initializing TrajoptNode");
-        
-        // Load trajectory from file
-        auto goal_eePos_traj_2d = readCsvToVectorOfVectors<float>(traj_file);
-        
-        // Convert 2D trajectory to 1D
-        std::vector<float> goal_eePos_traj_1d;
-        for (const auto& vec : goal_eePos_traj_2d) {
-            goal_eePos_traj_1d.insert(goal_eePos_traj_1d.end(), vec.begin(), vec.end());
-        }
-
-        // Initialize solver
-        solver_ = std::make_unique<TrajoptSolver<float, 12, 6, 128, 128>>(
-            goal_eePos_traj_1d,
-            timestep_.count(),
-            pcg_exit_tol_,
-            pcg_max_iter_
-        );
-
-        // Create subscribers and publishers
         state_sub_ = create_subscription<msgs::JointState>(
             "joint_states", 1, 
             std::bind(&TrajoptNode::stateCallback, this, std::placeholders::_1)
         );
 
         traj_pub_ = create_publisher<msgs::JointTrajectory>("joint_trajectory", 1);
-
-        // Wait for initial state
-        RCLCPP_INFO(this->get_logger(), "Waiting for initial state...");
-        while (rclcpp::ok() && !state_updated_) {
-            rclcpp::spin_some(this->get_node_base_interface());
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        RCLCPP_INFO(this->get_logger(), "Initial state received");
-
-        std::vector<float> pos_vec(current_state_.positions.begin(), current_state_.positions.end());
-        solver_->initializeXU(pos_vec);
-        RCLCPP_INFO(this->get_logger(), "Starting solver warm start...");
-        solver_->warmStart();
-        warm_start_complete_ = true;
-        RCLCPP_INFO(this->get_logger(), "Solver warm start complete");
-
-        // Pre-allocate message objects
-        traj_msg_.knot_points = 128;
-        traj_msg_.points.reserve(128);
-        full_state_.reserve(12);  // 6 positions + 6 velocities
         
-        // Pre-fill trajectory points to avoid allocations during runtime
-        for (int i = 0; i < 128; i++) {
+        // Initialize solver with trajectory from file
+        std::vector<float> goal_eePos_traj_1d = readCsvToVector<float>(traj_file);
+        solver_ = std::make_unique<TrajoptSolver<float>>(
+            goal_eePos_traj_1d,
+            timestep_.count(),
+            pcg_exit_tol_,
+            pcg_max_iter_
+        );
+        RCLCPP_INFO(this->get_logger(), "Solver initialized");
+
+        // Pre-allocate
+        traj_msg_.knot_points = solver_->numKnotPoints();
+        for (int i = 0; i < solver_->numKnotPoints(); i++) {
             msgs::JointTrajectoryPoint point;
             traj_msg_.points.emplace_back(point);
         }
+        full_state_.reserve(solver_->stateSize());
+
+        
+        RCLCPP_INFO(this->get_logger(), "Waiting for initial state...");
+        while (rclcpp::ok() && !state_updated_) {
+            rclcpp::spin_some(this->get_node_base_interface());
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        std::vector<float> current_joint_positions(current_state_.positions.begin(), current_state_.positions.end());
+        solver_->initializeXU(current_joint_positions);
+        RCLCPP_INFO(this->get_logger(), "Received initial state, starting solver warm start...");
+        solver_->warmStart();
+        cudaDeviceSynchronize(); //cuda operations are asynchronous, so we need to synchronize here
+        warm_start_complete_ = true;
+        if (use_sim_time_) {
+            // Wait for valid sim time
+            while (rclcpp::ok() && current_state_.header.stamp.sec == 0) {
+                rclcpp::spin_some(this->get_node_base_interface());
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            trajectory_start_stamp_ = current_state_.header.stamp;
+        } else {
+            trajectory_start_time_ = Clock::now();
+        }
+        RCLCPP_INFO(this->get_logger(), "Warm start complete");
     }
 
     ~TrajoptNode() {
@@ -88,11 +91,10 @@ public:
     }
 
 private:
-    void stateCallback(const msgs::JointState::SharedPtr msg)
+    void stateCallback(const std::shared_ptr<const msgs::JointState>& msg)
     {
-        // Skip if optimization is already running
+        // Skip if optimization is already running or warm start is not complete
         if (optimization_in_progress_.load()) {
-            RCLCPP_DEBUG(this->get_logger(), "Skipping optimization - previous iteration still running");
             return;
         }
 
@@ -101,8 +103,8 @@ private:
             current_state_ = *msg;
             // Convert from degrees to radians
             for (int i = 0; i < 6; i++) {
-                current_state_.positions[i] = current_state_.positions[i] * M_PI / 180.0;
-                current_state_.velocities[i] = current_state_.velocities[i] * M_PI / 180.0;
+                current_state_.positions[i] = current_state_.positions[i];
+                current_state_.velocities[i] = current_state_.velocities[i];
             }
             state_updated_ = true;
         }
@@ -111,34 +113,34 @@ private:
             return;
         }
 
-        // Early return if trajectory is complete
         if (solver_->isTrajectoryComplete()) {
             return;
         }
 
         optimization_in_progress_ = true;
 
-        // Pre-allocate full_state with the correct size to avoid reallocations
-        std::vector<float> full_state;
-        full_state.reserve(current_state_.positions.size() * 2);  // Reserve space for positions + velocities
-        full_state.insert(full_state.end(), 
+        full_state_.clear();  // Clear before inserting new state
+        full_state_.insert(full_state_.end(), 
             current_state_.positions.begin(), 
             current_state_.positions.end());
-        full_state.insert(full_state.end(), 
+        full_state_.insert(full_state_.end(), 
             current_state_.velocities.begin(), 
             current_state_.velocities.end());
 
-        // Convert ROS time to system_clock time
-        auto now = Clock::now();
-        if (trajectory_start_time_ == TimePoint()) {
-            trajectory_start_time_ = now;
+        // Calculate elapsed time based on use_sim_time_ setting
+        double elapsed_time;
+        if (use_sim_time_) {
+            SimTime current_time(msg->header.stamp);
+            SimTime start_time(trajectory_start_stamp_);
+            elapsed_time = (current_time - start_time).seconds();
+        } else {
+            auto now = Clock::now();
+            Duration elapsed = now - trajectory_start_time_;
+            elapsed_time = elapsed.count();
         }
         
-        // Calculate elapsed time
-        Duration elapsed = now - trajectory_start_time_;
-        
-        // Run optimization
-        solver_->shiftTrajectory(full_state, elapsed.count());
+        // Shift trajectory and run optimization
+        solver_->shiftTrajectory(full_state_, elapsed_time);
         std::string stats = solver_->runTrajoptIteration();
         RCLCPP_INFO(this->get_logger(), "Optimization stats: %s", stats.c_str());
         
@@ -153,35 +155,25 @@ private:
     {
         auto traj_msg = msgs::JointTrajectory();
         traj_msg.header.stamp = stamp;
-        traj_msg.knot_points = 128;  // KNOT_POINTS
+        traj_msg.knot_points = solver_->numKnotPoints(); 
         traj_msg.dt = timestep_.count();  // Convert Duration to double
 
         // Get optimized trajectory from solver
         const auto [traj_data, traj_size] = solver_->getOptimizedTrajectory();
         
-        // Populate trajectory points
-        const int stride = 18;  // StateSize + ControlSize = 12 + 6
-        const int num_joints = 6;  // StateSize/2
+        const int stride = solver_->stateSize() + solver_->controlSize();
         
-        traj_msg.points.reserve(traj_msg.knot_points);
         for (int i = 0; i < traj_msg.knot_points; i++) {
-            msgs::JointTrajectoryPoint point;
-            
-            // Extract positions (first 6 values of state)
             for (size_t j = 0; j < 6; ++j) {
-                point.positions[j] = traj_data[i * stride + j] * 180.0 / M_PI;
-                point.velocities[j] = traj_data[i * stride + num_joints + j] * 180.0 / M_PI;
+                traj_msg.points[i].positions[j] = traj_data[i * stride + j];// * 180.0 / M_PI;
+                traj_msg.points[i].velocities[j] = traj_data[i * stride + solver_->stateSize()/2 + j];// * 180.0 / M_PI;
+                traj_msg.points[i].torques[j] = traj_data[i * stride + solver_->stateSize() + j];
             }
-            
-            traj_msg.points.emplace_back(point);
         }
 
         traj_pub_->publish(traj_msg);
-        RCLCPP_INFO(this->get_logger(), "Published trajectory: %f %f %f %f %f %f",
-                    traj_msg.points[0].positions[0], traj_msg.points[0].positions[1], traj_msg.points[0].positions[2], traj_msg.points[0].positions[3], traj_msg.points[0].positions[4], traj_msg.points[0].positions[5]);
     }
 
-    // Node members
     std::unique_ptr<TrajoptSolver<float, 12, 6, 128, 128>> solver_;
     rclcpp::Subscription<msgs::JointState>::SharedPtr state_sub_;
     rclcpp::Publisher<msgs::JointTrajectory>::SharedPtr traj_pub_;
@@ -197,9 +189,11 @@ private:
     std::atomic<bool> warm_start_complete_;
     std::atomic<bool> optimization_in_progress_{false};
 
-    // Reuse these objects instead of creating new ones each callback
     msgs::JointTrajectory traj_msg_;
     std::vector<float> full_state_;
+
+    bool use_sim_time_;
+    builtin_interfaces::msg::Time trajectory_start_stamp_;
 };
 
 int main(int argc, char* argv[])

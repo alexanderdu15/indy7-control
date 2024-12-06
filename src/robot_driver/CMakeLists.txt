@@ -90,9 +90,17 @@ ament_target_dependencies(robot_driver_node
   indy7_msgs
 )
 
+add_executable(sim_driver_node src/sim_driver_node.cpp)
+ament_target_dependencies(sim_driver_node
+  rclcpp
+  indy7_msgs
+)
+
+
 # Install targets
 install(TARGETS
   robot_driver_node
+  sim_driver_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

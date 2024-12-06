@@ -24,7 +24,7 @@ include_directories(
 )
 
 # Set CUDA flags
-set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-O3)
+set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-O3;-diag-suppress=970,737)
 
 # Add the executable
 cuda_add_executable(trajopt_node

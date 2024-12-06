@@ -5,12 +5,12 @@
 #include "gpu_pcg.cuh"
 #include "pcg/sqp.cuh"
 
-template <typename T, int StateSize, int ControlSize, int KnotPoints, int NumPcgThreads>
+template <typename T, int StateSize=12, int ControlSize=6, int KnotPoints=128, int NumPcgThreads=128>
 class TrajoptSolver {
 public:
-    TrajoptSolver(const std::vector<T>& goal_eePos_traj_1d, //TODO: better name for this?
+    TrajoptSolver(const std::vector<T>& goal_eePos_traj_1d,
                   const T timestep,
-                  const T pcg_exit_tol, 
+                  const T pcg_exit_tol,
                   const int pcg_max_iter) 
                   : timestep_(timestep),
                     pcg_exit_tol_(pcg_exit_tol),
@@ -184,6 +184,18 @@ public:
 
     uint32_t getTrajectoryOffset() const {
         return traj_offset_;
+    }
+
+    uint32_t numKnotPoints() const {
+        return KnotPoints;
+    }
+
+    uint32_t stateSize() const {
+        return StateSize;
+    }
+
+    uint32_t controlSize() const {
+        return ControlSize;
     }
 
     std::pair<const T*, size_t> getOptimizedTrajectory() {

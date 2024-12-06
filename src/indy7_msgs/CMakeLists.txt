@@ -25,6 +25,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/JointTrajectory.msg"
   "msg/JointTrajectoryPoint.msg"
   "msg/JointState.msg"
+  "msg/JointCommand.msg"
+  "msg/JointTorque.msg"
   DEPENDENCIES std_msgs
 )
 

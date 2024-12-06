@@ -6,11 +6,19 @@ from ament_index_python.packages import get_package_share_directory
 import os
 
 def generate_launch_description():
-    # Robot driver node
-    driver_node = Node(
+    # MuJoCo simulation node
+    mujoco_sim_node = Node(
+        package='mujoco_sim',
+        executable='mujoco_sim_node',
+        name='mujoco_sim',
+        output='screen'
+    )
+
+    # Simulation driver node
+    sim_driver_node = Node(
         package='robot_driver',
-        executable='robot_driver_node',
-        name='robot_driver',
+        executable='sim_driver_node',
+        name='sim_driver',
         output='screen'
     )
 
@@ -24,6 +32,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        driver_node,
+        mujoco_sim_node,
+        sim_driver_node,
         trajopt_node
-    ])
+    ]) 

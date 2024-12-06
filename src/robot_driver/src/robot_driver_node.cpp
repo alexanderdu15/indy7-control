@@ -40,7 +40,7 @@ public:
         );
 
         trajectory_timer_ = create_wall_timer(
-            std::chrono::milliseconds(8),  // 125Hz for trajectory execution
+            std::chrono::milliseconds(1),  // 125Hz for trajectory execution
             std::bind(&RobotDriverNode::trajectoryExecutionCallback, this)
         );
     }
